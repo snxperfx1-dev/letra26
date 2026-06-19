@@ -1,5 +1,5 @@
 //@version=6
-indicator("Letra 26", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_polylines_count=100)
+indicator("Morgan", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_polylines_count=100)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SECTION 1 — INPUT GROUPS
@@ -6090,125 +6090,234 @@ if showCtxArcs and ctxArcL2
         arcL2 := polyline.new(arcL2pts, curved=true, xloc=xloc.bar_time, line_color=color.new(color.yellow, 25), line_style=line.style_dashed, line_width=2)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PING PONG MODE (v90)
-// Always-in, alternating system: BUY the up-legs, SELL the down-legs, flipping on
-// every structure reversal of the selected source. Captures BOTH sides of the
-// oscillation instead of waiting for one directional setup. Self-contained and
-// off by default — does NOT alter the V72 execution engine; it runs in parallel
-// with its own signals, alerts and panel so you can act on every move.
+// ENGINE 1A.9B — ALTERNATING FLIP ECHO (AFE) ENGINE
+// ───────────────────────────────────────────────────────────────────────────────
+// Six-step self-return / echo narrative between a FU ORIGIN (authority) and its
+// two flip zones. The FU origin is ALWAYS the higher authority/destination; the
+// flip zones change ROLE across the cycle (Destination → Launch → Liquidity →
+// Consumed). Models the exact sequence the trader described:
+//   Upper FU → Upper Flip → Lower Flip → (Upper Flip consumed) → Upper FU → new low
+// Read-only narrative engine: it does NOT fire trades, only state + panel + alert.
 // ═══════════════════════════════════════════════════════════════════════════════
-var string GRP_PP = "Ping Pong Mode"
-ppMode        = input.bool(false, "Enable Ping Pong Mode",            group=GRP_PP)
-ppSource      = input.string("L0 (M5)", "Flip Trigger Source",
-     options=["Chart CHoCH", "M1", "L3 (M3)", "L0 (M5)", "L1 (M15)", "L2 (H1)"], group=GRP_PP)
-ppShowSignals = input.bool(true,  "Show Ping Pong Signals",          group=GRP_PP)
-ppShowPanel   = input.bool(true,  "Show Ping Pong Panel",            group=GRP_PP)
-ppAlertOn     = input.bool(true,  "Alert on Ping Pong Flip",         group=GRP_PP)
-ppFilter      = input.bool(false, "Filter: only flip WITH fractal-stack direction", group=GRP_PP)
-ppTpR         = input.float(2.0,  "Take Profit (R multiple of stop)",group=GRP_PP, minval=0.5, maxval=10.0, step=0.5)
+var string GRP_AFE = "Engine 1A.9B — Alternating Flip Echo"
+afeOn         = input.bool  (true, "Enable AFE Path Arrows",             group=GRP_AFE)
+afeSource     = input.string("L0 (M5)", "AFE Structure Source",
+     options=["L3 (M3)", "L0 (M5)", "L1 (M15)", "L2 (H1)", "H4"],        group=GRP_AFE)
+afeTouchATR   = input.float (0.30, "Touch Tolerance (ATR)",              group=GRP_AFE, minval=0.05, maxval=1.5, step=0.05)
 
-// Chart-CHoCH direction (used only when the source is "Chart CHoCH")
-var int pp_chartDir = 0
-if bullCHoCH
-    pp_chartDir := 1
-if bearCHoCH
-    pp_chartDir := -1
+// ── Source structural references (origin = FU authority; flip band = flips) ──
+float afe_frzTop = afeSource == "L3 (M3)" ? l3_frzTop : afeSource == "L1 (M15)" ? l1_frzTop : afeSource == "L2 (H1)" ? l2_frzTop : afeSource == "H4" ? se240_ft : l0_frzTop
+float afe_frzBot = afeSource == "L3 (M3)" ? l3_frzBot : afeSource == "L1 (M15)" ? l1_frzBot : afeSource == "L2 (H1)" ? l2_frzBot : afeSource == "H4" ? se240_fb : l0_frzBot
+float afe_swH    = afeSource == "L3 (M3)" ? l3_swH    : afeSource == "L1 (M15)" ? l1_swH    : afeSource == "L2 (H1)" ? l2_swH    : afeSource == "H4" ? l4_swH    : l0_swH
+float afe_swL    = afeSource == "L3 (M3)" ? l3_swL    : afeSource == "L1 (M15)" ? l1_swL    : afeSource == "L2 (H1)" ? l2_swL    : afeSource == "H4" ? l4_swL    : l0_swL
 
-// Selected structure direction that drives the flips
-int pp_srcDir =
-     ppSource == "Chart CHoCH" ? pp_chartDir :
-     ppSource == "M1"          ? m1_dir      :
-     ppSource == "L3 (M3)"     ? l3_dir      :
-     ppSource == "L0 (M5)"     ? l0_dir      :
-     ppSource == "L1 (M15)"    ? l1_dir      : l2_dir
+// Upper FU = authority high (origin); Upper Flip = flip-zone top; Lower Flip = flip-zone bot.
+float afe_upperFU   = na(afe_swH)    ? afe_frzTop : afe_swH
+float afe_upperFlip = na(afe_frzTop) ? afe_swH    : afe_frzTop
+float afe_lowerFlip = na(afe_frzBot) ? afe_swL    : afe_frzBot
 
-var int   pp_pos      = 0     // current side: 1 long, -1 short, 0 flat
-var float pp_entry    = na    // entry price of the current leg
-var int   pp_entryBar = na
-var int   pp_flips    = 0
-var float pp_cumPts   = 0.0   // realised points captured across all legs
-var float pp_lastLeg  = 0.0   // points captured on the last closed leg
-var float pp_sl       = na    // current trade stop loss
-var float pp_tp       = na    // current trade take profit
-var int   pp_wins     = 0
-var int   pp_losses   = 0
-// Source structural swings (for the stop) — match the flip-trigger source
-float pp_swH = ppSource == "M1" ? m1_swH : ppSource == "L3 (M3)" ? l3_swH : ppSource == "L1 (M15)" ? l1_swH : ppSource == "L2 (H1)" ? l2_swH : l0_swH
-float pp_swL = ppSource == "M1" ? m1_swL : ppSource == "L3 (M3)" ? l3_swL : ppSource == "L1 (M15)" ? l1_swL : ppSource == "L2 (H1)" ? l2_swL : l0_swL
+bool _afeValid   = afeOn and not na(afe_upperFU) and not na(afe_upperFlip) and not na(afe_lowerFlip)
+float _afeTol    = atr * afeTouchATR
+bool _afeAtFU    = _afeValid and math.abs(close - afe_upperFU)   <= _afeTol
+bool _afeAtUFlip = _afeValid and math.abs(close - afe_upperFlip) <= _afeTol
+bool _afeAtLFlip = _afeValid and math.abs(close - afe_lowerFlip) <= _afeTol
+bool _afeBelowL  = _afeValid and close < afe_lowerFlip - _afeTol
 
-// Flip when the source direction opposes (or initialises) the current side.
-// Optional filter: when on, only flip in the fractal-stack direction (reduces chop).
-bool pp_rawFlip = ppMode and pp_srcDir != 0 and pp_srcDir != pp_pos
-bool pp_flip    = pp_rawFlip and (pp_pos == 0 or not ppFilter or pp_srcDir == fractalStackDir)
-if pp_flip
-    if pp_pos != 0 and not na(pp_entry)
-        pp_lastLeg := (close - pp_entry) * pp_pos
-        pp_cumPts  := pp_cumPts + pp_lastLeg
-        if pp_lastLeg > 0
-            pp_wins := pp_wins + 1
-        else if pp_lastLeg < 0
-            pp_losses := pp_losses + 1
-    pp_pos      := pp_srcDir
-    pp_entry    := close
-    pp_entryBar := bar_index
-    pp_flips    := pp_flips + 1
-    // Structural stop = the source's opposing swing (fallback: 1.5 ATR); TP = R multiple
-    pp_sl       := pp_srcDir == 1 ? (not na(pp_swL) and pp_swL < close ? pp_swL : close - atr * 1.5) : (not na(pp_swH) and pp_swH > close ? pp_swH : close + atr * 1.5)
-    float _ppRisk = math.max(math.abs(close - pp_sl), atr * 0.1)
-    pp_tp       := pp_srcDir == 1 ? close + _ppRisk * ppTpR : close - _ppRisk * ppTpR
-    if ppShowSignals
-        label.new(bar_index, pp_srcDir == 1 ? low - atr * 0.5 : high + atr * 0.5,
-             pp_srcDir == 1 ? "PP BUY" : "PP SELL",
-             style     = pp_srcDir == 1 ? label.style_label_up : label.style_label_down,
-             color     = pp_srcDir == 1 ? color.new(color.teal, 0) : color.new(color.red, 0),
-             textcolor = color.white, size = size.small)
+// ── Six-step state machine (drives the projected-path arrow) ─────────────────
+var int    afe_state = 0
+var string afe_dest  = "Upper FU"
 
-bool pp_buySignal  = pp_flip and pp_srcDir == 1
-bool pp_sellSignal = pp_flip and pp_srcDir == -1
-alertcondition(pp_buySignal,  title="Ping Pong BUY",  message="Ping Pong: flip LONG")
-alertcondition(pp_sellSignal, title="Ping Pong SELL", message="Ping Pong: flip SHORT")
+if _afeValid
+    if afe_state == 0
+        afe_state := 1
+        afe_dest  := "Upper FU"
+    if afe_state == 1 and close < afe_upperFlip - _afeTol
+        afe_state := 2
+        afe_dest  := "Lower Flip"
+    if afe_state == 2 and _afeAtUFlip
+        afe_state := 3
+        afe_dest  := "Upper Flip"
+    if afe_state == 3 and _afeAtLFlip
+        afe_state := 4
+        afe_dest  := "Lower Flip"
+    if afe_state == 4 and close > afe_upperFlip + _afeTol
+        afe_state := 5
+        afe_dest  := "Upper FU (flip=fuel)"
+    if afe_state == 5 and _afeAtFU
+        afe_state := 6
+        afe_dest  := "New Low"
+    if afe_state == 6 and _afeBelowL
+        afe_state := 1
+        afe_dest  := "Upper FU"
 
-// Floating points on the open leg
-float pp_openPts = (ppMode and pp_pos != 0 and not na(pp_entry)) ? (close - pp_entry) * pp_pos : 0.0
-int   pp_decided = pp_wins + pp_losses
-float pp_winRate = pp_decided > 0 ? pp_wins / pp_decided * 100.0 : 0.0
+// Price level the AFE path arrow points to for the current step
+float afe_destPx = (afe_state == 1 or afe_state == 5) ? afe_upperFU : afe_state == 3 ? afe_upperFlip : afe_state == 6 ? afe_lowerFlip - atr * 2.0 : afe_lowerFlip
 
-// Current-trade Stop / Target lines (refreshed on last bar)
-var line pp_slLine = na
-var line pp_tpLine = na
-if ppMode and barstate.islast
-    if not na(pp_slLine)
-        line.delete(pp_slLine)
-    if not na(pp_tpLine)
-        line.delete(pp_tpLine)
-    if pp_pos != 0 and not na(pp_sl) and not na(pp_tp)
-        pp_slLine := line.new(bar_index, pp_sl, bar_index + 30, pp_sl, color=color.red, width=1, style=line.style_dashed)
-        pp_tpLine := line.new(bar_index, pp_tp, bar_index + 30, pp_tp, color=#00ff88, width=1, style=line.style_dashed)
+bool afe_changed = afeOn and afe_state != afe_state[1] and afe_state != 0
+alertcondition(afe_changed, title="AFE State Change", message="AFE Engine: narrative state advanced")
 
-// ── Ping Pong panel ──────────────────────────────────────────────────────────
-if ppMode and ppShowPanel and barstate.islast and showTable
-    var table ppT = table.new(position.top_center, 2, 10, bgcolor=color.new(#05050f, 0), border_color=color.new(color.fuchsia, 40), border_width=1, frame_color=color.new(color.fuchsia, 20), frame_width=1)
-    string _ppsz = dashTextSize == "tiny" ? size.tiny : dashTextSize == "normal" ? size.normal : size.small
-    table.cell(ppT, 0, 0, "PING PONG", text_color=color.black, bgcolor=color.new(color.fuchsia, 0), text_size=_ppsz)
-    table.cell(ppT, 1, 0, pp_pos == 1 ? "LONG" : pp_pos == -1 ? "SHORT" : "FLAT", text_color=color.black, bgcolor=(pp_pos == 1 ? #00ff88 : pp_pos == -1 ? color.red : color.gray), text_size=_ppsz)
-    table.cell(ppT, 0, 1, "Source", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 1, ppSource + (ppFilter ? " (filtered)" : ""), text_color=color.white, text_size=_ppsz)
-    table.cell(ppT, 0, 2, "Entry", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 2, na(pp_entry) ? "–" : str.tostring(math.round_to_mintick(pp_entry)), text_color=color.white, text_size=_ppsz)
-    table.cell(ppT, 0, 3, "Stop", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 3, na(pp_sl) ? "–" : str.tostring(math.round_to_mintick(pp_sl)), text_color=color.red, text_size=_ppsz)
-    table.cell(ppT, 0, 4, "Target", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 4, na(pp_tp) ? "–" : str.tostring(math.round_to_mintick(pp_tp)), text_color=#00ff88, text_size=_ppsz)
-    table.cell(ppT, 0, 5, "Open Leg", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 5, str.tostring(pp_openPts, "#.##") + " pts", text_color=(pp_openPts >= 0 ? #00ff88 : color.red), text_size=_ppsz)
-    table.cell(ppT, 0, 6, "R:R", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 6, str.tostring(ppTpR, "#.#") + " : 1", text_color=color.white, text_size=_ppsz)
-    table.cell(ppT, 0, 7, "Flips", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 7, str.tostring(pp_flips), text_color=color.white, text_size=_ppsz)
-    table.cell(ppT, 0, 8, "Win %", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 8, pp_decided == 0 ? "–" : str.tostring(math.round(pp_winRate)) + "%  (" + str.tostring(pp_wins) + "/" + str.tostring(pp_decided) + ")", text_color=(pp_winRate >= 50 ? #00ff88 : color.red), text_size=_ppsz)
-    table.cell(ppT, 0, 9, "Cum Pts", text_color=color.fuchsia, text_size=_ppsz)
-    table.cell(ppT, 1, 9, str.tostring(pp_cumPts, "#.##"), text_color=(pp_cumPts >= 0 ? #00ff88 : color.red), text_size=_ppsz)
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENGINE 1A.10 — FU CONVERSATION SCANNER  (Global Recursive Path Engine)
+// ───────────────────────────────────────────────────────────────────────────────
+// Sits ABOVE the structure / destination / target / induction / AFE engines.
+// Price does not move between highs and lows — it moves between CONVERSATIONS
+// between validated FU origins and their flip zones across timeframes. This
+// scanner registers every fixed-TF FU origin + flip zone as a node, measures the
+// active conversation around live price, and maps the unfinished paths (stories)
+// price is trying to travel, each with a confidence. Higher-TF nodes carry more
+// authority (H4 > H1 > M15 > M5 > M3 > M1).
+// ═══════════════════════════════════════════════════════════════════════════════
+var string GRP_FUCS = "Engine 1A.10 — FU Conversation Scanner"
+fucsOn = input.bool(true, "Enable FU Conversation Path Arrows", group=GRP_FUCS)
+
+// Persistent scanner outputs (consumed by the path-arrow drawer + alert)
+var string fucs_seekNm  = "—"
+var float  fucs_seekPx  = na
+var float  fucs_interPx = na
+var int    fucs_dom     = 0
+
+if fucsOn
+    // ── FU REGISTRY — fixed-TF origins + flip zones (weight = TF authority) ──
+    array<string> _nm = array.new<string>()
+    array<float>  _px = array.new<float>()
+    array<int>    _wt = array.new<int>()
+    if not na(se240_inv)
+        array.push(_nm, "H4 FU")
+        array.push(_px, se240_inv)
+        array.push(_wt, 6)
+    if not na(l2_invalidation)
+        array.push(_nm, "H1 FU")
+        array.push(_px, l2_invalidation)
+        array.push(_wt, 5)
+    if not na(l2_frzTop)
+        array.push(_nm, "H1 Flip↑")
+        array.push(_px, l2_frzTop)
+        array.push(_wt, 5)
+    if not na(l2_frzBot)
+        array.push(_nm, "H1 Flip↓")
+        array.push(_px, l2_frzBot)
+        array.push(_wt, 5)
+    if not na(l1_invalidation)
+        array.push(_nm, "M15 FU")
+        array.push(_px, l1_invalidation)
+        array.push(_wt, 4)
+    if not na(l1_frzTop)
+        array.push(_nm, "M15 Flip↑")
+        array.push(_px, l1_frzTop)
+        array.push(_wt, 4)
+    if not na(l1_frzBot)
+        array.push(_nm, "M15 Flip↓")
+        array.push(_px, l1_frzBot)
+        array.push(_wt, 4)
+    if not na(l0_invalidation)
+        array.push(_nm, "M5 FU")
+        array.push(_px, l0_invalidation)
+        array.push(_wt, 3)
+    if not na(l0_frzTop)
+        array.push(_nm, "M5 Flip↑")
+        array.push(_px, l0_frzTop)
+        array.push(_wt, 3)
+    if not na(l0_frzBot)
+        array.push(_nm, "M5 Flip↓")
+        array.push(_px, l0_frzBot)
+        array.push(_wt, 3)
+    if not na(l3_invalidation)
+        array.push(_nm, "M3 FU")
+        array.push(_px, l3_invalidation)
+        array.push(_wt, 2)
+    if not na(m1_invalidation)
+        array.push(_nm, "M1 FU")
+        array.push(_px, m1_invalidation)
+        array.push(_wt, 1)
+
+    // ── CONVERSATION DETECTOR — nearest + strongest aligned node each side ──
+    int    _n    = array.size(_px)
+    float  _upD  = 1e20
+    float  _dnD  = 1e20
+    float  _upPx = na
+    float  _dnPx = na
+    int    _upBW = -1
+    int    _dnBW = -1
+    float  _upBD = 1e20
+    float  _dnBD = 1e20
+    string _upBNm = "—"
+    string _dnBNm = "—"
+    float  _upBPx = na
+    float  _dnBPx = na
+    if _n > 0
+        for i = 0 to _n - 1
+            float  p  = array.get(_px, i)
+            int    w  = array.get(_wt, i)
+            string nm = array.get(_nm, i)
+            if p > close
+                float d = p - close
+                if d < _upD
+                    _upD  := d
+                    _upPx := p
+                if w > _upBW or (w == _upBW and d < _upBD)
+                    _upBW  := w
+                    _upBD  := d
+                    _upBNm := nm
+                    _upBPx := p
+            else if p < close
+                float d2 = close - p
+                if d2 < _dnD
+                    _dnD  := d2
+                    _dnPx := p
+                if w > _dnBW or (w == _dnBW and d2 < _dnBD)
+                    _dnBW  := w
+                    _dnBD  := d2
+                    _dnBNm := nm
+                    _dnBPx := p
+
+    // ── PATH GENERATOR — dominant stack direction picks the primary path ─────
+    bool _down = fractalStackDir == -1
+    fucs_dom     := fractalStackDir
+    fucs_seekNm  := _down ? _dnBNm : _upBNm
+    fucs_seekPx  := _down ? _dnBPx : _upBPx
+    fucs_interPx := _down ? _dnPx : _upPx
+
+bool fucs_shift = fucsOn and fucs_seekNm != fucs_seekNm[1]
+alertcondition(fucs_shift, title="FU Conversation Shift", message="FU Conversation Scanner: active path changed")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NARRATIVE PATH ARROWS — Engine 1A.9B (AFE) + Engine 1A.10 (Conversation)
+// No panels. Each engine projects its expected path to the RIGHT of price as
+// arrows: the conversation scanner draws price → intermediate liquidity → target
+// FU; the AFE engine draws price → its current-step destination. Toggle each via
+// the engine enable inputs in Settings.
+// ═══════════════════════════════════════════════════════════════════════════════
+var line  npLn1  = na
+var line  npLn2  = na
+var label npLbl  = na
+var line  npAfe  = na
+var label npAfeL = na
+if barstate.islast
+    if not na(npLn1)
+        line.delete(npLn1)
+    if not na(npLn2)
+        line.delete(npLn2)
+    if not na(npLbl)
+        label.delete(npLbl)
+    if not na(npAfe)
+        line.delete(npAfe)
+    if not na(npAfeL)
+        label.delete(npAfeL)
+    // FU Conversation primary path: price → intermediate liquidity → strongest FU
+    if fucsOn and not na(fucs_seekPx)
+        color _pc = fucs_dom == -1 ? color.new(#ff5a5a, 0) : color.new(#5aff9e, 0)
+        bool _useInter = not na(fucs_interPx) and (fucs_interPx - close) * (fucs_seekPx - close) > 0 and math.abs(fucs_interPx - close) < math.abs(fucs_seekPx - close)
+        if _useInter
+            npLn1 := line.new(bar_index, close, bar_index + 8, fucs_interPx, color=_pc, width=2)
+            npLn2 := line.new(bar_index + 8, fucs_interPx, bar_index + 18, fucs_seekPx, color=_pc, width=2, style=line.style_dashed)
+        else
+            npLn1 := line.new(bar_index, close, bar_index + 18, fucs_seekPx, color=_pc, width=2)
+        npLbl := label.new(bar_index + 18, fucs_seekPx, fucs_seekNm, style=fucs_seekPx >= close ? label.style_label_down : label.style_label_up, color=_pc, textcolor=color.black, size=size.small)
+    // AFE echo path: price → current-step destination
+    if afeOn and _afeValid and not na(afe_destPx)
+        color _ac = afe_destPx >= close ? color.new(#5ad1ff, 0) : color.new(#ffd000, 0)
+        npAfe  := line.new(bar_index, close, bar_index + 12, afe_destPx, color=_ac, width=1, style=line.style_dotted)
+        npAfeL := label.new(bar_index + 12, afe_destPx, "AFE → " + afe_dest, style=afe_destPx >= close ? label.style_label_down : label.style_label_up, color=_ac, textcolor=color.black, size=size.tiny)
 
 
 
