@@ -1,5 +1,5 @@
 //@version=6
-indicator("Letra 27", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_polylines_count=100)
+indicator("Letra 28", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_polylines_count=100)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SECTION 1 — INPUT GROUPS
@@ -6100,11 +6100,9 @@ if showCtxArcs and ctxArcL2
 // Read-only narrative engine: it does NOT fire trades, only state + panel + alert.
 // ═══════════════════════════════════════════════════════════════════════════════
 var string GRP_AFE = "Engine 1A.9B — Alternating Flip Echo"
-afeOn         = input.bool  (true, "Enable AFE Engine",                  group=GRP_AFE)
+afeOn         = input.bool  (true, "Enable AFE Path Arrows",             group=GRP_AFE)
 afeSource     = input.string("L0 (M5)", "AFE Structure Source",
      options=["L3 (M3)", "L0 (M5)", "L1 (M15)", "L2 (H1)", "H4"],        group=GRP_AFE)
-afeShowLevels = input.bool  (true, "Show AFE Reference Lines",           group=GRP_AFE)
-afeAlertOn    = input.bool  (true, "Alert on AFE State Change",          group=GRP_AFE)
 afeTouchATR   = input.float (0.30, "Touch Tolerance (ATR)",              group=GRP_AFE, minval=0.05, maxval=1.5, step=0.05)
 
 // ── Source structural references (origin = FU authority; flip band = flips) ──
@@ -6125,78 +6123,38 @@ bool _afeAtUFlip = _afeValid and math.abs(close - afe_upperFlip) <= _afeTol
 bool _afeAtLFlip = _afeValid and math.abs(close - afe_lowerFlip) <= _afeTol
 bool _afeBelowL  = _afeValid and close < afe_lowerFlip - _afeTol
 
-// ── Six-step state machine + flip-zone role evolution ────────────────────────
-var int    afe_state    = 0
-var string afe_flipRole = "Destination"
-var string afe_dest     = "—"
-var string afe_target   = "—"
+// ── Six-step state machine (drives the projected-path arrow) ─────────────────
+var int    afe_state = 0
+var string afe_dest  = "Upper FU"
 
 if _afeValid
     if afe_state == 0
-        afe_state    := 1
-        afe_flipRole := "Destination"
-        afe_dest     := "Upper FU"
-        afe_target   := "Upper FU"
-    // 1 → 2  expansion down (price leaves Upper Flip downward)
+        afe_state := 1
+        afe_dest  := "Upper FU"
     if afe_state == 1 and close < afe_upperFlip - _afeTol
-        afe_state  := 2
-        afe_dest   := "Lower Flip"
-        afe_target := "Lower Flip"
-    // 2 → 3  self-return up to Upper Flip (flip still acts as Destination)
+        afe_state := 2
+        afe_dest  := "Lower Flip"
     if afe_state == 2 and _afeAtUFlip
-        afe_state    := 3
-        afe_flipRole := "Destination"
-        afe_dest     := "Upper Flip"
-        afe_target   := "Upper Flip"
-    // 3 → 4  selloff to Lower Flip (pre-existing destination)
+        afe_state := 3
+        afe_dest  := "Upper Flip"
     if afe_state == 3 and _afeAtLFlip
-        afe_state  := 4
-        afe_dest   := "Lower Flip"
-        afe_target := "Lower Flip"
-    // 4 → 5  Lower Flip reversal: Upper Flip consumed as LIQUIDITY, target Upper FU
+        afe_state := 4
+        afe_dest  := "Lower Flip"
     if afe_state == 4 and close > afe_upperFlip + _afeTol
-        afe_state    := 5
-        afe_flipRole := "Liquidity"
-        afe_dest     := "Upper FU"
-        afe_target   := "Upper FU"
-    // 5 → 6  Upper FU reached → supply wins → continuation to a new low
+        afe_state := 5
+        afe_dest  := "Upper FU (flip=fuel)"
     if afe_state == 5 and _afeAtFU
-        afe_state  := 6
-        afe_dest   := "Expansion ↓"
-        afe_target := "New Low"
-    // 6 → 1  new low printed → cycle restarts on the next origin
+        afe_state := 6
+        afe_dest  := "New Low"
     if afe_state == 6 and _afeBelowL
-        afe_state    := 1
-        afe_flipRole := "Destination"
-        afe_dest     := "Upper FU"
-        afe_target   := "Upper FU"
+        afe_state := 1
+        afe_dest  := "Upper FU"
 
-string afe_stateName =
-     afe_state == 1 ? "1 · Origin (Upper FU set)"     :
-     afe_state == 2 ? "2 · Expansion Down"            :
-     afe_state == 3 ? "3 · Self-Return → Upper Flip"  :
-     afe_state == 4 ? "4 · Selloff → Lower Flip"      :
-     afe_state == 5 ? "5 · Reversal ↑ (Flip = fuel)"  :
-     afe_state == 6 ? "6 · Continuation → New Low"    : "Idle"
+// Price level the AFE path arrow points to for the current step
+float afe_destPx = (afe_state == 1 or afe_state == 5) ? afe_upperFU : afe_state == 3 ? afe_upperFlip : afe_state == 6 ? afe_lowerFlip - atr * 2.0 : afe_lowerFlip
 
-bool afe_changed = afeOn and afeAlertOn and afe_state != afe_state[1] and afe_state != 0
+bool afe_changed = afeOn and afe_state != afe_state[1] and afe_state != 0
 alertcondition(afe_changed, title="AFE State Change", message="AFE Engine: narrative state advanced")
-
-// ── AFE reference lines (Upper FU / Upper Flip / Lower Flip) on last bar ─────
-var line afe_lnFU = na
-var line afe_lnUF = na
-var line afe_lnLF = na
-if barstate.islast
-    if not na(afe_lnFU)
-        line.delete(afe_lnFU)
-    if not na(afe_lnUF)
-        line.delete(afe_lnUF)
-    if not na(afe_lnLF)
-        line.delete(afe_lnLF)
-    if afeOn and afeShowLevels and _afeValid
-        afe_lnFU := line.new(bar_index, afe_upperFU,   bar_index + 25, afe_upperFU,   color=color.new(#ff7fe6, 0),  width=2, style=line.style_solid)
-        afe_lnUF := line.new(bar_index, afe_upperFlip, bar_index + 25, afe_upperFlip, color=color.new(#ffd000, 10), width=1, style=line.style_dashed)
-        afe_lnLF := line.new(bar_index, afe_lowerFlip, bar_index + 25, afe_lowerFlip, color=color.new(#5ad1ff, 10), width=1, style=line.style_dashed)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ENGINE 1A.10 — FU CONVERSATION SCANNER  (Global Recursive Path Engine)
@@ -6210,22 +6168,13 @@ if barstate.islast
 // authority (H4 > H1 > M15 > M5 > M3 > M1).
 // ═══════════════════════════════════════════════════════════════════════════════
 var string GRP_FUCS = "Engine 1A.10 — FU Conversation Scanner"
-fucsOn    = input.bool(true, "Enable FU Conversation Scanner", group=GRP_FUCS)
-fucsAlert = input.bool(true, "Alert on Conversation Shift",    group=GRP_FUCS)
+fucsOn = input.bool(true, "Enable FU Conversation Path Arrows", group=GRP_FUCS)
 
-// Persistent scanner outputs (read by the combined panel + alerts)
-var string fucs_node  = "—"
-var string fucs_seek  = "—"
-var string fucs_inter = "—"
-var string fucs_then  = "—"
-var string fucs_state = "—"
-var float  fucs_conf  = na
-var string fucs_s1    = "—"
-var float  fucs_s1c   = na
-var string fucs_s2    = "—"
-var float  fucs_s2c   = na
-var string fucs_s3    = "—"
-var float  fucs_s3c   = na
+// Persistent scanner outputs (consumed by the path-arrow drawer + alert)
+var string fucs_seekNm  = "—"
+var float  fucs_seekPx  = na
+var float  fucs_interPx = na
+var int    fucs_dom     = 0
 
 if fucsOn
     // ── FU REGISTRY — fixed-TF origins + flip zones (weight = TF authority) ──
@@ -6281,18 +6230,14 @@ if fucsOn
         array.push(_px, m1_invalidation)
         array.push(_wt, 1)
 
-    // ── CONVERSATION DETECTOR — nearest + strongest node on each side ────────
-    int    _n   = array.size(_px)
-    float  _upD = 1e20                          // nearest distance up
-    float  _dnD = 1e20                          // nearest distance down
-    string _upNm = "—"
-    string _dnNm = "—"
+    // ── CONVERSATION DETECTOR — nearest + strongest aligned node each side ──
+    int    _n    = array.size(_px)
+    float  _upD  = 1e20
+    float  _dnD  = 1e20
     float  _upPx = na
     float  _dnPx = na
-    int    _upWn = 0                            // nearest-node weight up
-    int    _dnWn = 0                            // nearest-node weight down
-    int    _upBW = -1                           // strongest weight up
-    int    _dnBW = -1                           // strongest weight down
+    int    _upBW = -1
+    int    _dnBW = -1
     float  _upBD = 1e20
     float  _dnBD = 1e20
     string _upBNm = "—"
@@ -6301,144 +6246,78 @@ if fucsOn
     float  _dnBPx = na
     if _n > 0
         for i = 0 to _n - 1
-            float p  = array.get(_px, i)
-            int   w  = array.get(_wt, i)
+            float  p  = array.get(_px, i)
+            int    w  = array.get(_wt, i)
             string nm = array.get(_nm, i)
             if p > close
                 float d = p - close
                 if d < _upD
-                    _upD := d
-                    _upNm := nm
+                    _upD  := d
                     _upPx := p
-                    _upWn := w
                 if w > _upBW or (w == _upBW and d < _upBD)
-                    _upBW := w
-                    _upBD := d
+                    _upBW  := w
+                    _upBD  := d
                     _upBNm := nm
                     _upBPx := p
             else if p < close
                 float d2 = close - p
                 if d2 < _dnD
-                    _dnD := d2
-                    _dnNm := nm
+                    _dnD  := d2
                     _dnPx := p
-                    _dnWn := w
                 if w > _dnBW or (w == _dnBW and d2 < _dnBD)
-                    _dnBW := w
-                    _dnBD := d2
+                    _dnBW  := w
+                    _dnBD  := d2
                     _dnBNm := nm
                     _dnBPx := p
 
-    // ── PATH GENERATOR — dominant stack direction drives the primary story ──
-    int   _dom  = fractalStackDir
-    float _ctx  = fractalCtxScore
-    bool  _down = _dom == -1
-    // Current node = closest validated structure to live price
-    string _curNm = _upD <= _dnD ? _upNm : _dnNm
-    int    _curW  = _upD <= _dnD ? _upWn : _dnWn
-    // Primary destination = strongest FU in the dominant direction (default up)
-    string _seekNm = _down ? _dnBNm : _upBNm
-    float  _seekPx = _down ? _dnBPx : _upBPx
-    int    _seekW  = _down ? _dnBW  : _upBW
-    float  _seekD  = _down ? _dnBD  : _upBD
-    // Intermediate liquidity = nearest node between price and that destination
-    string _interNm = _down ? _dnNm : _upNm
-    float  _interPx = _down ? _dnPx : _upPx
-    // Opposing destination (secondary story)
-    string _oppNm = _down ? _upBNm : _dnBNm
+    // ── PATH GENERATOR — dominant stack direction picks the primary path ─────
+    bool _down = fractalStackDir == -1
+    fucs_dom     := fractalStackDir
+    fucs_seekNm  := _down ? _dnBNm : _upBNm
+    fucs_seekPx  := _down ? _dnBPx : _upBPx
+    fucs_interPx := _down ? _dnPx : _upPx
 
-    // Confidence: blends fractal context score with proximity to destination
-    float _prox = (_seekD > 1e19) ? 0.0 : math.max(0.0, 100.0 - (_seekD / math.max(atr, 1e-10)) * 6.0)
-    float _c1 = math.round(math.min(95.0, 0.55 * _ctx + 0.45 * _prox))
-    float _c2 = math.round(math.max(4.0, math.min(42.0, 100.0 - _c1 - 10.0)))
-    float _c3 = math.round(math.max(2.0, 100.0 - _c1 - _c2))
-
-    // Conversation state (relationship of destination to current node)
-    string _st = _seekW > _curW ? "SEEKING_PARENT" : _seekW < _curW ? "SEEKING_CHILD" : "SEEKING_SELF"
-    if _upBW >= 0 and _upBW == _dnBW
-        _st := "COMPETING"
-    if _dom == 0
-        _st := "ECHOING"
-
-    fucs_node  := _curNm
-    fucs_seek  := _seekNm + (na(_seekPx) ? "" : "  @ " + str.tostring(math.round_to_mintick(_seekPx)))
-    fucs_inter := (_interNm == _seekNm) ? "(direct)" : _interNm + (na(_interPx) ? "" : "  @ " + str.tostring(math.round_to_mintick(_interPx)))
-    fucs_then  := _down ? "Expansion ↓ (continuation)" : "Tag FU → reversal / expansion"
-    fucs_state := _st
-    fucs_conf  := _c1
-    fucs_s1    := (_down ? "↓ " : "↑ ") + _seekNm + " → expansion"
-    fucs_s1c   := _c1
-    fucs_s2    := (_down ? "↑ " : "↓ ") + _oppNm + " continuation"
-    fucs_s2c   := _c2
-    fucs_s3    := "Direct attack → H4 FU"
-    fucs_s3c   := _c3
-
-bool fucs_shift = fucsOn and fucsAlert and fucs_seek != fucs_seek[1]
+bool fucs_shift = fucsOn and fucs_seekNm != fucs_seekNm[1]
 alertcondition(fucs_shift, title="FU Conversation Shift", message="FU Conversation Scanner: active path changed")
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// COMBINED NARRATIVE PANEL — Engine 1A.9B (AFE) + Engine 1A.10 (Conversation)
-// Single middle-center table to keep token cost low and avoid dashboard overlap.
+// NARRATIVE PATH ARROWS — Engine 1A.9B (AFE) + Engine 1A.10 (Conversation)
+// No panels. Each engine projects its expected path to the RIGHT of price as
+// arrows: the conversation scanner draws price → intermediate liquidity → target
+// FU; the AFE engine draws price → its current-step destination. Toggle each via
+// the engine enable inputs in Settings.
 // ═══════════════════════════════════════════════════════════════════════════════
-if (afeOn or fucsOn) and barstate.islast and showTable
-    string _nz = dashTextSize == "tiny" ? size.tiny : dashTextSize == "normal" ? size.normal : size.small
-    var table afeT = table.new(position.middle_center, 2, 20, bgcolor=color.new(#05050f, 0), border_color=color.new(#ff2fd0, 40), border_width=1, frame_color=color.new(#ff2fd0, 20), frame_width=1)
-    int _r = 0
-    if afeOn
-        table.cell(afeT, 0, _r, "AFE ECHO 1A.9B", text_color=color.black, bgcolor=color.new(#ff7fe6, 0), text_size=_nz)
-        table.cell(afeT, 1, _r, afeSource, text_color=color.black, bgcolor=color.new(#ff7fe6, 0), text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "State", text_color=#ff7fe6, text_size=_nz)
-        table.cell(afeT, 1, _r, afe_stateName, text_color=color.white, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Upper FU", text_color=#ff7fe6, text_size=_nz)
-        table.cell(afeT, 1, _r, na(afe_upperFU) ? "–" : str.tostring(math.round_to_mintick(afe_upperFU)) + "  (authority)", text_color=#ff7fe6, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Upper Flip", text_color=#ffd000, text_size=_nz)
-        table.cell(afeT, 1, _r, (na(afe_upperFlip) ? "–" : str.tostring(math.round_to_mintick(afe_upperFlip))) + "  · " + afe_flipRole, text_color=#ffd000, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Lower Flip", text_color=#5ad1ff, text_size=_nz)
-        table.cell(afeT, 1, _r, na(afe_lowerFlip) ? "–" : str.tostring(math.round_to_mintick(afe_lowerFlip)), text_color=#5ad1ff, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Destination", text_color=#ff7fe6, text_size=_nz)
-        table.cell(afeT, 1, _r, afe_dest, text_color=#5aff9e, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Next Target", text_color=#ff7fe6, text_size=_nz)
-        table.cell(afeT, 1, _r, afe_target, text_color=color.white, text_size=_nz)
-        _r += 1
-    if fucsOn
-        table.cell(afeT, 0, _r, "FU CONVERSATION 1A.10", text_color=color.black, bgcolor=color.new(#00e5ff, 0), text_size=_nz)
-        table.cell(afeT, 1, _r, "PRICE " + str.tostring(math.round_to_mintick(close)), text_color=color.black, bgcolor=color.new(#00e5ff, 0), text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Current Node", text_color=#5ad1ff, text_size=_nz)
-        table.cell(afeT, 1, _r, fucs_node, text_color=color.white, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Seeking", text_color=#5ad1ff, text_size=_nz)
-        table.cell(afeT, 1, _r, fucs_seek, text_color=#5aff9e, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Intermediate Liq", text_color=#5ad1ff, text_size=_nz)
-        table.cell(afeT, 1, _r, fucs_inter, text_color=#ffe05a, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Then", text_color=#5ad1ff, text_size=_nz)
-        table.cell(afeT, 1, _r, fucs_then, text_color=color.white, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "State", text_color=#5ad1ff, text_size=_nz)
-        table.cell(afeT, 1, _r, fucs_state, text_color=color.white, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "Confidence", text_color=#5ad1ff, text_size=_nz)
-        table.cell(afeT, 1, _r, na(fucs_conf) ? "–" : str.tostring(fucs_conf, "#") + "%", text_color=(nz(fucs_conf) >= 60 ? #5aff9e : nz(fucs_conf) >= 35 ? #ffe05a : color.gray), text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, "── STORIES ──", text_color=#00e5ff, text_size=_nz)
-        table.cell(afeT, 1, _r, "", text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, fucs_s1, text_color=color.white, text_size=_nz)
-        table.cell(afeT, 1, _r, na(fucs_s1c) ? "–" : str.tostring(fucs_s1c, "#") + "%", text_color=#5aff9e, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, fucs_s2, text_color=color.white, text_size=_nz)
-        table.cell(afeT, 1, _r, na(fucs_s2c) ? "–" : str.tostring(fucs_s2c, "#") + "%", text_color=#ffe05a, text_size=_nz)
-        _r += 1
-        table.cell(afeT, 0, _r, fucs_s3, text_color=color.white, text_size=_nz)
-        table.cell(afeT, 1, _r, na(fucs_s3c) ? "–" : str.tostring(fucs_s3c, "#") + "%", text_color=color.gray, text_size=_nz)
+var line  npLn1  = na
+var line  npLn2  = na
+var label npLbl  = na
+var line  npAfe  = na
+var label npAfeL = na
+if barstate.islast
+    if not na(npLn1)
+        line.delete(npLn1)
+    if not na(npLn2)
+        line.delete(npLn2)
+    if not na(npLbl)
+        label.delete(npLbl)
+    if not na(npAfe)
+        line.delete(npAfe)
+    if not na(npAfeL)
+        label.delete(npAfeL)
+    // FU Conversation primary path: price → intermediate liquidity → strongest FU
+    if fucsOn and not na(fucs_seekPx)
+        color _pc = fucs_dom == -1 ? color.new(#ff5a5a, 0) : color.new(#5aff9e, 0)
+        bool _useInter = not na(fucs_interPx) and (fucs_interPx - close) * (fucs_seekPx - close) > 0 and math.abs(fucs_interPx - close) < math.abs(fucs_seekPx - close)
+        if _useInter
+            npLn1 := line.new(bar_index, close, bar_index + 8, fucs_interPx, color=_pc, width=2)
+            npLn2 := line.new(bar_index + 8, fucs_interPx, bar_index + 18, fucs_seekPx, color=_pc, width=2, style=line.style_dashed)
+        else
+            npLn1 := line.new(bar_index, close, bar_index + 18, fucs_seekPx, color=_pc, width=2)
+        npLbl := label.new(bar_index + 18, fucs_seekPx, fucs_seekNm, style=fucs_seekPx >= close ? label.style_label_down : label.style_label_up, color=_pc, textcolor=color.black, size=size.small)
+    // AFE echo path: price → current-step destination
+    if afeOn and _afeValid and not na(afe_destPx)
+        color _ac = afe_destPx >= close ? color.new(#5ad1ff, 0) : color.new(#ffd000, 0)
+        npAfe  := line.new(bar_index, close, bar_index + 12, afe_destPx, color=_ac, width=1, style=line.style_dotted)
+        npAfeL := label.new(bar_index + 12, afe_destPx, "AFE → " + afe_dest, style=afe_destPx >= close ? label.style_label_down : label.style_label_up, color=_ac, textcolor=color.black, size=size.tiny)
 
 
 
